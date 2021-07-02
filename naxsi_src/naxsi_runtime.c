@@ -2623,7 +2623,7 @@ ngx_http_naxsi_body_parse(ngx_http_request_ctx_t*     ctx,
            full_body_len);
 
   /* File probably got buffered. */
-  if (r->headers_in.content_length_n != full_body_len) {
+  if ((unsigned int) r->headers_in.content_length_n != full_body_len) {
     ngx_http_apply_rulematch_v_n(&nx_int__big_request, ctx, r, NULL, NULL, BODY, 1, 0);
     return;
   }
