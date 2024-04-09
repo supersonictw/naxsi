@@ -4,8 +4,8 @@
  * Licensed under GNU GPL v3.0 – See the LICENSE notice for details
  */
 
-#include "assert.h"
 #include "naxsi.h"
+#include "assert.h"
 #include "naxsi_macros.h"
 #include "naxsi_net.h"
 
@@ -181,6 +181,75 @@ ngx_http_naxsi_rawbody_parse(ngx_http_request_ctx_t* ctx,
 unsigned char*
 ngx_utf8_check(ngx_str_t* str);
 
+#if defined nginx_version && (nginx_version >= 1021005)
+/*
+ * variables to use pcre2
+ */
+static pcre2_match_data       *ngx_pcre2_match_data;
+static ngx_uint_t              ngx_pcre2_match_data_size;
+
+/*
+ * helper function to use pcre2
+ */
+ngx_int_t
+ngx_pcre2_exec(ngx_regex_t *re, unsigned char* str, unsigned int len, ngx_int_t tmp_idx, int *captures, ngx_uint_t size)
+{
+    size_t      *ov;
+    ngx_int_t    rc;
+    ngx_uint_t   n, i;
+
+    /*
+     * The pcre2_match() function might allocate memory for backtracking
+     * frames, typical allocations are from 40k and above.  So the allocator
+     * is configured to do direct allocations from heap during matching.
+     */
+
+    if (ngx_pcre2_match_data == NULL
+        || size > ngx_pcre2_match_data_size)
+    {
+        /*
+         * Allocate a match data if not yet allocated or smaller than
+         * needed.
+         */
+
+        if (ngx_pcre2_match_data) {
+            pcre2_match_data_free(ngx_pcre2_match_data);
+        }
+
+        ngx_pcre2_match_data_size = size;
+        ngx_pcre2_match_data = pcre2_match_data_create(size / 3, NULL);
+
+        if (ngx_pcre2_match_data == NULL) {
+            rc = PCRE2_ERROR_NOMEMORY;
+            goto failed;
+        }
+    }
+
+    rc = pcre2_match(re, str, len, tmp_idx, 0, ngx_pcre2_match_data, NULL);
+
+    if (rc < 0) {
+        goto failed;
+    }
+
+    n = pcre2_get_ovector_count(ngx_pcre2_match_data);
+    ov = pcre2_get_ovector_pointer(ngx_pcre2_match_data);
+
+    if (n > size / 3) {
+        n = size / 3;
+    }
+
+    for (i = 0; i < n; i++) {
+        captures[i * 2] = ov[i * 2];
+        captures[i * 2 + 1] = ov[i * 2 + 1];
+    }
+
+failed:
+
+    return rc;
+
+}
+#endif
+
 /*
 ** in : string to inspect, associated rule
 ** does : apply the rule on the string, return 1 if matched,
@@ -201,7 +270,14 @@ ngx_http_process_basic_rule_buffer(ngx_str_t* str, ngx_http_rule_t* rl, ngx_int_
     tmp_idx = 0;
     len     = str->len;
     while
-#if defined   nginx_version && (nginx_version >= 1002002 && nginx_version != 1003000)
+#if (NGX_PCRE2)
+      (tmp_idx < len && (match = ngx_pcre2_exec(rl->br->rx->regex,
+                                           str->data,
+                                           str->len,
+                                           tmp_idx,
+                                           captures,
+                                           30)) >= 0)
+#elif defined nginx_version && (nginx_version >= 1002002 && nginx_version != 1003000)
       (tmp_idx < len && (match = pcre_exec(rl->br->rx->regex->code,
                                            0,
                                            (const char*)str->data,
@@ -496,7 +572,9 @@ ngx_http_naxsi_pcre_wrapper(ngx_regex_compile_t* rx, unsigned char* str, unsigne
   int match;
   int captures[30];
 
-#if defined   nginx_version && (nginx_version >= 1002002 && nginx_version != 1003000)
+#if (NGX_PCRE2)
+  match = ngx_pcre2_exec(rx->regex, str, len, 0, captures, 1);
+#elif defined nginx_version && (nginx_version >= 1002002 && nginx_version != 1003000)
   match = pcre_exec(rx->regex->code, 0, (const char*)str, len, 0, 0, captures, 1);
 #elif defined nginx_version && (nginx_version > 1001011)
   match = pcre_exec(rx->regex->pcre, 0, (const char*)str, len, 0, 0, captures, 1);
@@ -1262,7 +1340,7 @@ ngx_http_output_forbidden_page(ngx_http_request_ctx_t* ctx, ngx_http_request_t* 
   if (!ctx->json_log) {
     for (i = 0; i < ostr->nelts; i++) {
       ngx_log_error(
-        NGX_LOG_ERR, r->connection->log, 0, "NAXSI_FMT: %s", ((ngx_str_t*)ostr->elts)[i].data);
+        NGX_LOG_ERR, cf->log ? cf->log : r->connection->log, 0, "NAXSI_FMT: %s", ((ngx_str_t*)ostr->elts)[i].data);
     }
   } else {
     const char* hex  = "0123456789abcdef";
@@ -2828,17 +2906,19 @@ ngx_http_naxsi_data_parse(ngx_http_request_ctx_t* ctx, ngx_http_request_t* r)
   /* check args */
   ngx_http_naxsi_args_parse(main_cf, cf, ctx, r);
   /* check method */
-  if ((r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT) &&
-      /* presence of body rules (POST/PUT rules) */
+  if ((r->method == NGX_HTTP_PATCH || r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT) &&
+      /* presence of body rules (PATCH/POST/PUT rules) */
       (cf->body_rules || main_cf->body_rules) &&
       /* and the presence of data to parse */
       r->request_body && ((!ctx->block || ctx->learning) && !ctx->drop))
     ngx_http_naxsi_body_parse(ctx, r, cf, main_cf);
+#if (NGX_HTTP_X_FORWARDED_FOR)
   ngx_str_t tag;
   tag.len  = 15;
   tag.data = ngx_pcalloc(r->pool, tag.len + 1);
   if (tag.data)
     memcpy(tag.data, "x-forwarded-for", 15);
+#if (nginx_version < 1023000)
   unsigned int      n = 0;
   ngx_table_elt_t** h = NULL;
   ngx_array_t       a;
@@ -2853,6 +2933,16 @@ ngx_http_naxsi_data_parse(ngx_http_request_ctx_t* ctx, ngx_http_request_t* r)
 
     ngx_http_naxsi_update_current_ctx_status(ctx, cf, r, &tag, (ngx_str_t*)h[0]->value.data);
   }
+#else
+  ngx_table_elt_t* xff = NULL;
+  if (r->headers_in.x_forwarded_for != NULL) {
+    xff = r->headers_in.x_forwarded_for;
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "xfor %s", xff->value.data);
+
+    ngx_http_naxsi_update_current_ctx_status(ctx, cf, r, &tag, (ngx_str_t*)xff->value.data);
+  }
+#endif
+#endif
 }
 
 void
@@ -2867,18 +2957,20 @@ ngx_http_naxsi_update_current_ctx_status(ngx_http_request_ctx_t*    ctx,
   ngx_http_check_rule_t* cr;
 
   ngx_http_special_score_t* sc;
-  unsigned int              n = 0;
 
   NX_DEBUG(_debug_custom_score, NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "XX-custom check rules");
 
   int               ignore = 0;
-  ngx_table_elt_t** h;
-  ngx_array_t       a;
 
   ctx->ignore = 0;
 
   /*cr, sc, cf, ctx*/
   if (cf->check_rules && ctx->special_scores) {
+#if (NGX_HTTP_X_FORWARDED_FOR)
+#if (nginx_version < 1023000)
+      unsigned int              n = 0;
+      ngx_table_elt_t** h;
+      ngx_array_t       a;
     if (r->headers_in.x_forwarded_for.nelts >= 1) {
       a = r->headers_in.x_forwarded_for;
       n = a.nelts;
@@ -2896,7 +2988,26 @@ ngx_http_naxsi_update_current_ctx_status(ngx_http_request_ctx_t*    ctx,
         memcpy(ip.data, h[0]->value.data, ip.len);
         ignore = nx_can_ignore_ip(&ip, cf) || nx_can_ignore_cidr(&ip, cf);
       }
-    } else {
+    } else
+#else
+    ngx_table_elt_t* xff;
+    if (r->headers_in.x_forwarded_for != NULL) {
+      xff = r->headers_in.x_forwarded_for;
+      NX_DEBUG(_debug_whitelist_ignore,
+                 NGX_LOG_DEBUG_HTTP,
+                 r->connection->log,
+                 0,
+                 "XX- lookup ignore X-Forwarded-For: %s",
+                 xff->value.data);
+      ngx_str_t ip;
+      ip.len  = strlen((char*)xff->value.data);
+      ip.data = ngx_pcalloc(r->pool, ip.len + 1);
+      memcpy(ip.data, xff->value.data, ip.len);
+      ignore = nx_can_ignore_ip(&ip, cf) || nx_can_ignore_cidr(&ip, cf);
+    } else
+#endif
+#endif
+    {
       ngx_str_t* ip = &r->connection->addr_text;
       NX_DEBUG(_debug_whitelist_ignore,
                NGX_LOG_DEBUG_HTTP,

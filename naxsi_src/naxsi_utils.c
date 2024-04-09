@@ -800,7 +800,11 @@ ngx_http_naxsi_create_hashtables_n(ngx_http_naxsi_loc_conf_t* dlc, ngx_conf_t* c
             ngx_pcalloc(cf->pool, sizeof(ngx_regex_compile_t));
           rgc = custloc_array(curr_r->br->custom_locations->elts)[name_idx].target_rx;
           if (rgc) {
+#if (NGX_PCRE2)
+            rgc->options  = PCRE2_CASELESS | PCRE2_MULTILINE;
+#else
             rgc->options  = PCRE_CASELESS | PCRE_MULTILINE;
+#endif
             rgc->pattern  = custloc_array(curr_r->br->custom_locations->elts)[name_idx].target;
             rgc->pool     = cf->pool;
             rgc->err.len  = 0;
@@ -816,7 +820,11 @@ ngx_http_naxsi_create_hashtables_n(ngx_http_naxsi_loc_conf_t* dlc, ngx_conf_t* c
             ngx_pcalloc(cf->pool, sizeof(ngx_regex_compile_t));
           rgc = custloc_array(curr_r->br->custom_locations->elts)[uri_idx].target_rx;
           if (rgc) {
+#if (NGX_PCRE2)
+            rgc->options  = PCRE2_CASELESS | PCRE2_MULTILINE;
+#else
             rgc->options  = PCRE_CASELESS | PCRE_MULTILINE;
+#endif
             rgc->pattern  = custloc_array(curr_r->br->custom_locations->elts)[uri_idx].target;
             rgc->pool     = cf->pool;
             rgc->err.len  = 0;
@@ -892,6 +900,7 @@ naxsi_log_offending(ngx_str_t*          name,
                     naxsi_match_zone_t  zone,
                     ngx_int_t           target_name)
 {
+  ngx_http_naxsi_loc_conf_t* cf;
   ngx_str_t tmp_uri, tmp_val, tmp_name;
   ngx_str_t empty = ngx_string("");
 
@@ -925,8 +934,9 @@ naxsi_log_offending(ngx_str_t*          name,
     ngx_escape_uri(tmp_name.data, name->data, name->len, NGX_ESCAPE_URI_COMPONENT);
   }
 
+  cf = ngx_http_get_module_loc_conf(req, ngx_http_naxsi_module);
   ngx_log_error(NGX_LOG_ERR,
-                req->connection->log,
+                cf->log ? cf->log : req->connection->log,
                 0,
                 "NAXSI_EXLOG: "
                 "ip=%V&server=%V&uri=%V&id=%d&zone=%s%s&var_name=%V&content=%V",
